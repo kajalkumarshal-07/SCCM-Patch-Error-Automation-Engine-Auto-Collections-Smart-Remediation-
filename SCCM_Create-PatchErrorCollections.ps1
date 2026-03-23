@@ -1,326 +1,200 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Creates SCCM Device Collections for each known Windows Update / SCCM patching error code.
+    Creates SCCM Device Collections for every known Software Update
+    enforcement error code — one collection for "Error" state and one
+    for "Unknown" state per code.
 
 .DESCRIPTION
-    Connects to the SCCM Site Server and creates one Device Collection per error code,
-    each with a WQL membership rule querying SMS_G_System_WORKSTATION_STATUS.LastErrorCode.
-    Collections are grouped under a single console folder for easy management.
+    Uses SMS_SUMDeploymentAssetDetails joined to SMS_R_System for accurate
+    per-deployment error reporting (same source as the SCCM console Software
+    Update deployment status view).
 
-    Covers 29 error codes including:
-      - Core WUA / Windows Update errors
-      - SCCM client handler job errors (0x87D00664, 0x87D00665)
-      - Delivery Optimization errors  (0x80D02002, 0x80D03805)
-      - CBS / Component Store corruption
-      - Reboot state errors
-      - Download / DP / BITS failures
-      - MSI / file lock errors
-      - Certificate trust errors
-      - XML parse / DataStore corruption (0x800705B9)
-      - CRC data errors / shutdown-interrupted installs (0x80070017, 0x8007045B)
-      - Invalid resource state (0x8007139F)
+    For each error code the script creates two collections:
+
+        [Enforcement State: Error]   Code <SignedDecimal>  — StatusType = 5
+        [Enforcement State: Unknown] Code <SignedDecimal>  — StatusType = 4
+
+    Collections are placed in separate console subfolders (configurable).
+    The script is safe to re-run — existing collections are skipped.
+
+    Error code catalogue covers 50 codes:
+      - SCCM handler / agent errors    (0x87D0xxxx)
+      - Windows Update / WUA errors    (0x8024xxxx)
+      - Windows system errors          (0x8007xxxx)
+      - CBS / Component Store errors
+      - Certificate / PKI errors
+      - Delivery Optimization errors   (0x80D0xxxx)
+      - WSUS errors                    (0xC180xxxx)
+      - Live environment captures
+
+    All signed decimal values verified with:  [int32][uint32]"0xHHHHHHHH"
+
+    To find error codes active in YOUR environment, run this SQL against
+    the ConfigMgr database:
+
+        SELECT COUNT(ResourceID) AS Devices,
+               LastEnforcementErrorCode,
+               StatusType
+        FROM vSMS_SUMDeploymentStatusPerAsset
+        WHERE StatusType IN (4,5)
+          AND LastEnforcementErrorCode IS NOT NULL
+          AND LastEnforcementErrorCode <> 0
+        GROUP BY LastEnforcementErrorCode, StatusType
+        ORDER BY COUNT(ResourceID) DESC
 
 .PARAMETER SiteServer
     FQDN or NetBIOS name of the SCCM Primary Site Server.
+    Optional if a CMSite PSDrive already exists in the session.
 
 .PARAMETER SiteCode
     Three-character SCCM Site Code (e.g. "PS1").
+    Optional — auto-detected from Get-PSDrive -PSProvider CMSite.
 
-.PARAMETER ParentFolderName
-    Console subfolder under Device Collections. Created if it does not exist.
-    Default: "Patch Error Collections"
-
-.PARAMETER LimitingCollectionName
+.PARAMETER LimitingCollection
     Limiting collection for all new collections.
     Default: "All Systems"
 
-.PARAMETER RefreshIntervalHours
-    Membership refresh interval in hours. Default: 4
+.PARAMETER ErrorFolder
+    Console path (relative to site drive) for "Error" state collections.
+    Default: "DeviceCollection\SUP\SUP Errors\Enforcement State Error"
+
+.PARAMETER UnknownFolder
+    Console path (relative to site drive) for "Unknown" state collections.
+    Default: "DeviceCollection\SUP\SUP Errors\Enforcement State Unknown"
+
+.PARAMETER RefreshSchedule
+    SCCM schedule string for collection membership refresh.
+    Default: "920A8C0000100008"  (every 7 days)
 
 .PARAMETER WhatIf
-    Dry-run mode - shows what would be created without touching SCCM.
+    Dry-run — shows what would be created without touching SCCM.
 
 .EXAMPLE
-    .\SCCM_Create-PatchErrorCollections.ps1 -SiteServer "SCCMSERVER.domain.local" -SiteCode "PS1"
+    # Auto-detect site, use all defaults
+    .\SCCM_Create-SUPErrorCollections.ps1
 
 .EXAMPLE
-    .\SCCM_Create-PatchErrorCollections.ps1 -SiteServer "SCCM01" -SiteCode "PS1" -WhatIf
+    # Explicit site server and code
+    .\SCCM_Create-SUPErrorCollections.ps1 `
+        -SiteServer "SCCMSERVER.domain.local" `
+        -SiteCode   "PS1"
 
 .EXAMPLE
-    .\SCCM_Create-PatchErrorCollections.ps1 `
-        -SiteServer             "SCCMSERVER.domain.local" `
-        -SiteCode               "PS1" `
-        -ParentFolderName       "Patch Errors" `
-        -LimitingCollectionName "All Workstations" `
-        -RefreshIntervalHours   6
+    # Dry run first (recommended before first execution)
+    .\SCCM_Create-SUPErrorCollections.ps1 -WhatIf
+
+.EXAMPLE
+    # Custom folders and limiting collection
+    .\SCCM_Create-SUPErrorCollections.ps1 `
+        -SiteCode           "PS1" `
+        -LimitingCollection "All Workstations" `
+        -ErrorFolder        "DeviceCollection\Patching\Errors\Error State" `
+        -UnknownFolder      "DeviceCollection\Patching\Errors\Unknown State"
 
 .NOTES
     Author   : IT Engineering
-    Version  : 2.0
-    Requires : ConfigurationManager PowerShell module (SCCM Admin Console installed)
+    Version  : 3.0
+    Requires : ConfigurationManager PowerShell module
+               (SCCM Admin Console installed on this machine)
     Run As   : Account with SCCM Full Administrator or Collections RBAC role
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    [Parameter(Mandatory)]
-    [string]$SiteServer,
-
-    [Parameter(Mandatory)]
-    [string]$SiteCode,
-
-    [string]$ParentFolderName       = "Patch Error Collections",
-    [string]$LimitingCollectionName = "All Systems",
-    [int]   $RefreshIntervalHours   = 4
+    [string]$SiteServer         = "",
+    [string]$SiteCode           = "",
+    [string]$LimitingCollection = "All Systems",
+    [string]$ErrorFolder        = "DeviceCollection\SUP\SUP Errors\Enforcement State Error",
+    [string]$UnknownFolder      = "DeviceCollection\SUP\SUP Errors\Enforcement State Unknown",
+    [string]$RefreshSchedule    = "920A8C0000100008"
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # =============================================================================
-# ERROR CODE CATALOGUE  -  29 entries
+# ERROR CODE CATALOGUE  —  50 codes
 #
-# DecimalCode = [uint32] equivalent of the hex code, used in WQL
-# WQL syntax:  SMS_G_System_WORKSTATION_STATUS.LastErrorCode = <DecimalCode>
+# Keys are SIGNED 32-bit decimal integers — the value stored in
+# SMS_SUMDeploymentAssetDetails.LastEnforcementErrorCode
+#
+# PowerShell conversion:  [int32][uint32]"0xHHHHHHHH"
+# Reverse:                "0x{0:X8}" -f [uint32][int32]<signed>
+#
 # =============================================================================
-$PatchErrors = @(
+$ErrorCodes = [ordered]@{
 
-    # -------------------------------------------------------------------------
-    # Core Windows / WUA errors
-    # -------------------------------------------------------------------------
-    @{
-        Code              = "0x80070005"
-        ShortName         = "AccessDenied"
-        Description       = "Access Denied - WUA or SCCM agent lacks permission to directories or registry"
-        DecimalCode       = 2147942405
-        RemediationScript = "Remediate-0x80070005_AccessDenied.ps1"
-    },
-    @{
-        Code              = "0x80070002"
-        ShortName         = "FileNotFound"
-        Description       = "Source file not found - content missing from DP cache or local staging area"
-        DecimalCode       = 2147942402
-        RemediationScript = "Remediate-0x80070002_DownloadFailed.ps1"
-    },
-    @{
-        Code              = "0x8007000E"
-        ShortName         = "OutOfMemory"
-        Description       = "Insufficient memory during update processing - staging cleanup required"
-        DecimalCode       = 2147942414
-        RemediationScript = "Remediate-0x800705B4_TimeoutWuaError.ps1"
-    },
-    @{
-        Code              = "0x80070017"
-        ShortName         = "CRCDataError"
-        Description       = "Cyclic Redundancy Check failure - corrupt cached download on disk"
-        DecimalCode       = 2147942423
-        RemediationScript = "Remediate-0x80070017_CRC_Shutdown.ps1"
-    },
-    @{
-        Code              = "0x80070020"
-        ShortName         = "FileLocked"
-        Description       = "File locked by another process - update install blocked"
-        DecimalCode       = 2147942432
-        RemediationScript = "Remediate-0x80070643_MsiFileLocked.ps1"
-    },
-    @{
-        Code              = "0x80070422"
-        ShortName         = "WUServiceDisabled"
-        Description       = "Windows Update service is disabled or startup type prevents it from running"
-        DecimalCode       = 2147943458
-        RemediationScript = "Remediate-0x80070422_WUServiceDisabled.ps1"
-    },
-    @{
-        Code              = "0x8007045B"
-        ShortName         = "ShutdownInProgress"
-        Description       = "System shutdown was in progress during install - partial install state left behind"
-        DecimalCode       = 2147943515
-        RemediationScript = "Remediate-0x80070017_CRC_Shutdown.ps1"
-    },
-    @{
-        Code              = "0x800705B4"
-        ShortName         = "Timeout"
-        Description       = "Operation timed out during download or install"
-        DecimalCode       = 2147943860
-        RemediationScript = "Remediate-0x800705B4_TimeoutWuaError.ps1"
-    },
-    @{
-        Code              = "0x800705B9"
-        ShortName         = "XmlParseError"
-        Description       = "Windows unable to parse XML data - corrupt DataStore.edb or malformed WSUS response"
-        DecimalCode       = 2147944889
-        RemediationScript = "Remediate-0x800705B9_XmlParseError.ps1"
-    },
-    @{
-        Code              = "0x80070BC2"
-        ShortName         = "RebootRequired"
-        Description       = "Update installed - device reboot required to finalise"
-        DecimalCode       = 2147944386
-        RemediationScript = "Remediate-0x80070BC9_RebootPending.ps1"
-    },
-    @{
-        Code              = "0x80070BC9"
-        ShortName         = "RebootPending"
-        Description       = "Pending reboot is blocking further update installation"
-        DecimalCode       = 2147944393
-        RemediationScript = "Remediate-0x80070BC9_RebootPending.ps1"
-    },
-    @{
-        Code              = "0x80070643"
-        ShortName         = "MsiInstallFailed"
-        Description       = "Fatal MSI/installer error - orphaned temp files or corrupt installer state"
-        DecimalCode       = 2147943987
-        RemediationScript = "Remediate-0x80070643_MsiFileLocked.ps1"
-    },
-    @{
-        Code              = "0x8007139F"
-        ShortName         = "InvalidResourceState"
-        Description       = "Group or resource not in correct state - WUA scan race condition or SCM conflict"
-        DecimalCode       = 2147946399
-        RemediationScript = "Remediate-0x8007139F_InvalidState.ps1"
-    },
+    # ── Success ────────────────────────────────────────────────────────────────
+    0                = 'Success'
 
-    # -------------------------------------------------------------------------
-    # CBS / Component Store
-    # -------------------------------------------------------------------------
-    @{
-        Code              = "0x80073712"
-        ShortName         = "CbsComponentCorrupt"
-        Description       = "Windows Component Store / CBS corruption detected - DISM repair required"
-        DecimalCode       = 2147954450
-        RemediationScript = "Remediate-0x80073712_CBSCorrupt.ps1"
-    },
-    @{
-        Code              = "0x8007371B"
-        ShortName         = "CbsTransactionError"
-        Description       = "CBS transaction/manifest error during update apply"
-        DecimalCode       = 2147954459
-        RemediationScript = "Remediate-0x80073712_CBSCorrupt.ps1"
-    },
+    # ── SCCM Updates Handler / Agent  (0x87D0xxxx → signed) ──────────────────
+    -2016409844      = 'Software update execution timeout'
+    -2016409966      = 'Group policy conflict'
+    -2016410008      = 'Software update still detected as actionable after apply'
+    -2016410011      = 'No updates to process in the SCCM handler job'               # 0x87D00665
+    -2016410012      = 'SCCM updates handler job was cancelled'                      # 0x87D00664
+    -2016410026      = 'Updates handler unable to continue - generic internal error'
+    -2016410031      = 'Post-install scan failed'
+    -2016410032      = 'Pre-install scan failed'
+    -2016410844      = 'Application not detected after installation completed'       # 0x87D00324
+    -2016410855      = 'Unknown SCCM error'
+    -2016411012      = 'CI documents download timed out'
+    -2016411115      = 'Item not found'
 
-    # -------------------------------------------------------------------------
-    # WUA agent internal errors
-    # -------------------------------------------------------------------------
-    @{
-        Code              = "0x80240010"
-        ShortName         = "WuaCancelled"
-        Description       = "Update cancelled by user or Group Policy during download or install"
-        DecimalCode       = 2145120272
-        RemediationScript = "Remediate-0x800705B4_TimeoutWuaError.ps1"
-    },
-    @{
-        Code              = "0x80240022"
-        ShortName         = "AllUpdatesNotApplicable"
-        Description       = "All updates returned as not applicable - scan cache or policy mismatch"
-        DecimalCode       = 2145116194
-        RemediationScript = "Remediate-0x800705B4_TimeoutWuaError.ps1"
-    },
-    @{
-        Code              = "0x80240FFF"
-        ShortName         = "WuaUnexpectedError"
-        Description       = "Unexpected WUA agent error - DataStore or agent component corruption"
-        DecimalCode       = 2145120255
-        RemediationScript = "Remediate-0x800705B4_TimeoutWuaError.ps1"
-    },
-    @{
-        Code              = "0x800F0991"
-        ShortName         = "SFXExtractionError"
-        Description       = "Unknown Error (-2146498159) - SFX/cab extraction failure or CBS manifest mismatch"
-        DecimalCode       = 2148533137
-        RemediationScript = "Remediate-0x800F0991_UnknownSFXError.ps1"
-    },
+    # ── WUA agent internal  (0x8024xxxx → signed) ─────────────────────────────
+    -2145107924      = 'Cannot connect to WSUS/SUP - proxy or DNS failure'           # 0x8024402C
+    -2145107934      = 'WSUS server returned HTTP 503 Service Unavailable'           # 0x80244022
+    -2145107951      = 'WUServer policy value missing in the registry'               # 0x8024002F
+    -2145120257      = 'Unexpected WUA agent error'                                  # 0x80240FFF
+    -2145123272      = 'No route or network connectivity to endpoint'
+    -2145124318      = 'All updates not applicable - scan cache or policy mismatch'  # 0x80240022
+    -2145124320      = 'Operation did not complete - no logged-on interactive user'
+    -2145124336      = 'Update cancelled by user or policy'                          # 0x80240010
+    -2145124341      = 'Operation was cancelled'
 
-    # -------------------------------------------------------------------------
-    # WSUS / Software Update Point connectivity
-    # -------------------------------------------------------------------------
-    @{
-        Code              = "0x80244022"
-        ShortName         = "WsusNoService"
-        Description       = "WSUS server returned HTTP 503 Service Unavailable"
-        DecimalCode       = 2149843490
-        RemediationScript = "Remediate-0x8024402C_WsusConnectFail.ps1"
-    },
-    @{
-        Code              = "0x8024402C"
-        ShortName         = "WsusConnectFail"
-        Description       = "Cannot connect to WSUS/SUP - proxy misconfiguration or DNS failure"
-        DecimalCode       = 2149843500
-        RemediationScript = "Remediate-0x8024402C_WsusConnectFail.ps1"
-    },
-    @{
-        Code              = "0xC1800118"
-        ShortName         = "WsusDeclined"
-        Description       = "Update declined on WSUS server - approval or policy issue"
-        DecimalCode       = 3247411992
-        RemediationScript = "Remediate-0x8024402C_WsusConnectFail.ps1"
-    },
+    # ── Windows system errors  (0x8007xxxx → signed) ──────────────────────────
+    -2147024894      = 'Source file not found - content missing from DP or staging'  # 0x80070002
+    -2147024891      = 'Access denied - WUA or SCCM agent lacks permission'          # 0x80070005
+    -2147024882      = 'Insufficient memory during update processing'                # 0x8007000E
+    -2147024873      = 'Cyclic Redundancy Check failure - corrupt cached download'   # 0x80070017
+    -2147024864      = 'File locked by another process - install blocked'            # 0x80070020
+    -2147024784      = 'Not enough disk space for update staging'                    # 0x80070070
+    -2147024598      = 'Too many posts were made to a semaphore'
+    -2147023890      = 'File volume externally altered - opened file no longer valid'
+    -2147023838      = 'Windows Update service disabled or startup type blocked'     # 0x80070422
+    -2147023781      = 'System shutdown in progress - install was interrupted'       # 0x8007045B
+    -2147023436      = 'Operation timed out during download or install'              # 0x800705B4
+    -2147023431      = 'Windows unable to parse XML data - corrupt DataStore.edb'   # 0x800705B9
+    -2147023293      = 'Fatal MSI/installer error - orphaned temp files'             # 0x80070643
+    -2147023728      = 'Element not found'
+    -2147021886      = 'Update installed - reboot required to finalise'              # 0x80070BC2
+    -2147021879      = 'Pending reboot blocking further update installation'         # 0x80070BC9
+    -2147019873      = 'Group or resource not in correct state - WUA/SCM conflict'  # 0x8007139F
+    -2147018095      = 'Transaction support in resource manager shut down due to error'
+    -2147467259      = 'Unspecified error'
+    -2147467260      = 'Operation aborted'
 
-    # -------------------------------------------------------------------------
-    # Download / BITS / Distribution Point
-    # -------------------------------------------------------------------------
-    @{
-        Code              = "0x80246007"
-        ShortName         = "DownloadFailed"
-        Description       = "Content download failed - Distribution Point unavailable or BITS error"
-        DecimalCode       = 2149844999
-        RemediationScript = "Remediate-0x80070002_DownloadFailed.ps1"
-    },
+    # ── CBS / Component Store  (0x8007xxxx range → signed) ────────────────────
+    -2147010798      = 'Windows Component Store / CBS corruption detected'           # 0x80073712
+    -2147010815      = 'The referenced assembly could not be found'
+    -2147010789      = 'CBS transaction or manifest error during update apply'       # 0x8007371B
+    -2147010893      = 'The referenced assembly is not installed on your system'
+    -2146498159      = 'SFX/cab extraction failure or CBS manifest mismatch'         # 0x800F0991
 
-    # -------------------------------------------------------------------------
-    # Delivery Optimization  (from IT Engineering live environment)
-    # -------------------------------------------------------------------------
-    @{
-        Code              = "0x80D02002"
-        ShortName         = "DODownloadStalled"
-        Description       = "Delivery Optimization download stalled - no progress within defined time window"
-        DecimalCode       = 2160919554
-        RemediationScript = "Remediate-0x80D02002_DeliveryOptimization.ps1"
-    },
-    @{
-        Code              = "0x80D03805"
-        ShortName         = "DOUnknownError"
-        Description       = "Delivery Optimization internal unknown error - peer caching or DO service failure"
-        DecimalCode       = 2160920581
-        RemediationScript = "Remediate-0x80D02002_DeliveryOptimization.ps1"
-    },
+    # ── Certificate / PKI ─────────────────────────────────────────────────────
+    -2146889721      = 'Hash value is not correct - file integrity failure'
+    -2146762496      = 'No signature was present in the subject'
+    -2146762487      = 'Certificate chain issued by untrusted authority'             # 0x800B0109
+    -2147217865      = 'Unknown database/query error'
 
-    # -------------------------------------------------------------------------
-    # Certificate / PKI
-    # -------------------------------------------------------------------------
-    @{
-        Code              = "0x800B0109"
-        ShortName         = "CertChainUntrusted"
-        Description       = "Certificate chain issued by untrusted authority - Root CA store needs update"
-        DecimalCode       = 2148204809
-        RemediationScript = "Remediate-0x800B0109_CertChainUntrusted.ps1"
-    },
+    # ── Delivery Optimization  (0x80D0xxxx → signed) ──────────────────────────
+    -2133843966      = 'DO download stalled - no progress within defined time window' # 0x80D02002
+    -2133837819      = 'Delivery Optimization unknown internal error'                 # 0x80D03805
 
-    # -------------------------------------------------------------------------
-    # SCCM client / handler job errors  (from IT Engineering live environment)
-    # -------------------------------------------------------------------------
-    @{
-        Code              = "0x87D00324"
-        ShortName         = "AppNotDetected"
-        Description       = "Application not detected after installation - SCCM detection rule mismatch"
-        DecimalCode       = 2278556452
-        RemediationScript = "Remediate-0x80070422_WUServiceDisabled.ps1"
-    },
-    @{
-        Code              = "0x87D00664"
-        ShortName         = "UpdatesHandlerCancelled"
-        Description       = "SCCM updates handler job was cancelled - stale WUAHandler state or CCM policy conflict"
-        DecimalCode       = 2278620772
-        RemediationScript = "Remediate-0x87D00664_UpdatesHandlerJob.ps1"
-    },
-    @{
-        Code              = "0x87D00665"
-        ShortName         = "NoUpdatesInJob"
-        Description       = "No updates to process in SCCM handler job - policy/scan sync gap between server and client"
-        DecimalCode       = 2278620773
-        RemediationScript = "Remediate-0x87D00664_UpdatesHandlerJob.ps1"
-    }
-)
+    # ── WSUS declined  (0xC1800118 → signed) ──────────────────────────────────
+    -1048575720      = 'Update declined on WSUS server'                              # 0xC1800118
+}
 
 # =============================================================================
 # Helpers
@@ -329,9 +203,9 @@ function Write-Banner {
     param([string]$Text, [string]$Color = "Cyan")
     $bar = "-" * ($Text.Length + 4)
     Write-Host ""
-    Write-Host "  $bar"  -ForegroundColor $Color
+    Write-Host "  $bar" -ForegroundColor $Color
     Write-Host "  | $Text |" -ForegroundColor $Color
-    Write-Host "  $bar"  -ForegroundColor $Color
+    Write-Host "  $bar" -ForegroundColor $Color
     Write-Host ""
 }
 function Write-Step {
@@ -340,136 +214,182 @@ function Write-Step {
 }
 
 # =============================================================================
-# Load ConfigMgr module and connect to site
+# Load ConfigMgr module
 # =============================================================================
-Write-Banner "SCCM Patch Error Collection Creator  v2.0"
+Write-Banner "SCCM SUP Error Collection Creator  v3.0"
 
 Write-Step ">" "Loading ConfigurationManager module..."
-if (-not (Get-Module ConfigurationManager -ListAvailable)) {
-    Write-Error "ConfigurationManager module not found. Install the SCCM Admin Console on this machine."
+$AdminUIPath = $env:SMS_ADMIN_UI_PATH
+if ($AdminUIPath) {
+    $Psd1 = $AdminUIPath.Replace("i386", "ConfigurationManager.psd1")
+    if (Test-Path $Psd1) {
+        Import-Module $Psd1 -ErrorAction Stop
+        Write-Step "+" "Loaded from SMS_ADMIN_UI_PATH" "Green"
+    }
 }
-Import-Module ConfigurationManager -ErrorAction Stop
+if (-not (Get-Module ConfigurationManager -ErrorAction SilentlyContinue)) {
+    Import-Module ConfigurationManager -ErrorAction Stop
+    Write-Step "+" "Loaded from PSModulePath" "Green"
+}
+
+# =============================================================================
+# Resolve site code and PSDrive
+# =============================================================================
+if ([string]::IsNullOrEmpty($SiteCode)) {
+    $Drive = Get-PSDrive -PSProvider CMSite -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($Drive) {
+        $SiteCode = $Drive.Name
+        Write-Step ">" "Auto-detected site code: $SiteCode" "Cyan"
+    } else {
+        Write-Error "Cannot auto-detect site code. Provide -SiteCode parameter."
+    }
+}
 
 $SiteDrive = "${SiteCode}:"
 if (-not (Get-PSDrive -Name $SiteCode -PSProvider CMSite -ErrorAction SilentlyContinue)) {
-    Write-Step ">" "Creating CMSite PSDrive for site $SiteCode on $SiteServer..."
+    if ([string]::IsNullOrEmpty($SiteServer)) {
+        Write-Error "No CMSite PSDrive found and -SiteServer not provided."
+    }
+    Write-Step ">" "Creating CMSite PSDrive for $SiteCode on $SiteServer..."
     New-PSDrive -Name $SiteCode -PSProvider CMSite -Root $SiteServer -ErrorAction Stop | Out-Null
 }
 Set-Location $SiteDrive
 
 # =============================================================================
-# Ensure parent console folder exists
+# Validate / create target console folders
 # =============================================================================
-Write-Step ">" "Checking console folder: '$ParentFolderName'..."
-$FolderPath = "${SiteDrive}\DeviceCollection\$ParentFolderName"
+$ErrorFolderPath   = "${SiteDrive}\$ErrorFolder"
+$UnknownFolderPath = "${SiteDrive}\$UnknownFolder"
 
-if (-not (Test-Path $FolderPath)) {
-    Write-Step "+" "Creating console folder: $ParentFolderName" "Yellow"
-    if ($PSCmdlet.ShouldProcess("DeviceCollection", "Create folder '$ParentFolderName'")) {
-        New-Item -Path "${SiteDrive}\DeviceCollection" -Name $ParentFolderName -ItemType Directory | Out-Null
+foreach ($FolderPath in @($ErrorFolderPath, $UnknownFolderPath)) {
+    if (-not (Test-Path $FolderPath)) {
+        Write-Step "!" "Folder not found: $FolderPath — creating..." "Yellow"
+        if ($PSCmdlet.ShouldProcess($FolderPath, "New-Item")) {
+            $Parts  = $FolderPath -split "\\"
+            $Parent = ($Parts[0..($Parts.Count - 2)]) -join "\"
+            $Leaf   = $Parts[-1]
+            New-Item -Path $Parent -Name $Leaf -ItemType Directory | Out-Null
+            Write-Step "+" "Created: $FolderPath" "Green"
+        }
+    } else {
+        Write-Step ">" "Folder OK: $FolderPath" "DarkGray"
     }
 }
 
 # =============================================================================
 # Refresh schedule
 # =============================================================================
-$Schedule = New-CMSchedule -RecurInterval Hours -RecurCount $RefreshIntervalHours -Start (Get-Date)
+$Schedule = Convert-CMSchedule -ScheduleString $RefreshSchedule
 
 # =============================================================================
-# Create one collection per error code
+# Create two collections per error code
 # =============================================================================
-$Results = [System.Collections.Generic.List[PSObject]]::new()
-$Created = 0
-$Skipped = 0
-$Failed  = 0
+$Results  = [System.Collections.Generic.List[PSObject]]::new()
+$Created  = 0
+$Skipped  = 0
+$Failed   = 0
+$CodeCount = ($ErrorCodes.Keys | Measure-Object).Count
+$Total     = $CodeCount * 2
 
-Write-Banner "Creating $($PatchErrors.Count) Device Collections" "Yellow"
+Write-Banner "Creating collections  ($CodeCount codes x 2 states = $Total)" "Yellow"
 
-foreach ($Err in $PatchErrors) {
+foreach ($Code in $ErrorCodes.Keys) {
 
-    $CollectionName = "Patch Error - $($Err.ShortName) [$($Err.Code)]"
+    $Description = $ErrorCodes[$Code]
 
-    # WQL query - joins SMS_R_System with WORKSTATION_STATUS on LastErrorCode
-    $WqlQuery = @"
+    # WQL query template — {0} is replaced with StatusType (4 or 5)
+    # Uses SMS_SUMDeploymentAssetDetails — the same join as the SCCM console
+    # deployment status view, giving accurate per-deployment error data
+    $BaseQuery = @"
 select
-    SMS_R_System.ResourceId,
-    SMS_R_System.ResourceType,
-    SMS_R_System.Name,
-    SMS_R_System.SMSUniqueIdentifier,
-    SMS_R_System.ResourceDomainORWorkgroup,
-    SMS_R_System.Client
+    SYS.ResourceID,
+    SYS.ResourceType,
+    SYS.Name,
+    SYS.SMSUniqueIdentifier,
+    SYS.ResourceDomainORWorkgroup,
+    SYS.Client
 from
-    SMS_R_System
+    SMS_R_System as SYS
 inner join
-    SMS_G_System_WORKSTATION_STATUS
-    on SMS_G_System_WORKSTATION_STATUS.ResourceID = SMS_R_System.ResourceId
+    SMS_SUMDeploymentAssetDetails as SUM
+    on SYS.ResourceID = SUM.ResourceID
 where
-    SMS_G_System_WORKSTATION_STATUS.LastErrorCode = $($Err.DecimalCode)
+    SUM.StatusType = {0}
+    and SUM.LastEnforcementErrorCode = $Code
 "@
 
-    # Skip if already exists
-    $Existing = Get-CMDeviceCollection -Name $CollectionName -ErrorAction SilentlyContinue
-    if ($Existing) {
-        Write-Step "~" "SKIP  (exists): $CollectionName" "DarkGray"
-        $Skipped++
-        $Results.Add([PSCustomObject]@{
-            ErrorCode   = $Err.Code
-            ShortName   = $Err.ShortName
-            Collection  = $CollectionName
-            Script      = $Err.RemediationScript
-            Status      = "Skipped - already exists"
-        })
-        continue
-    }
+    $Pairs = @(
+        @{ State = "Error";   StatusType = 5; Folder = $ErrorFolderPath   }
+        @{ State = "Unknown"; StatusType = 4; Folder = $UnknownFolderPath }
+    )
 
-    Write-Step "+" "Creating: $CollectionName" "Green"
+    foreach ($Pair in $Pairs) {
 
-    if ($PSCmdlet.ShouldProcess($CollectionName, "New-CMDeviceCollection")) {
-        try {
-            $NewCol = New-CMDeviceCollection `
-                -Name                   $CollectionName `
-                -Comment                "$($Err.Code) | $($Err.Description) | Remediation: $($Err.RemediationScript)" `
-                -LimitingCollectionName $LimitingCollectionName `
-                -RefreshSchedule        $Schedule `
-                -RefreshType            Periodic
+        $Name  = "[Enforcement State: $($Pair.State)]   Code $Code"
+        $Query = $BaseQuery -f $Pair.StatusType
 
-            Add-CMDeviceCollectionQueryMembershipRule `
-                -CollectionName  $CollectionName `
-                -QueryExpression $WqlQuery `
-                -RuleName        "Patch Error $($Err.Code)"
-
-            Move-CMObject -FolderPath $FolderPath -InputObject $NewCol
-
-            $Created++
+        $Existing = Get-CMDeviceCollection -Name $Name -ErrorAction SilentlyContinue
+        if ($Existing) {
+            Write-Step "~" "SKIP (exists): $Name" "DarkGray"
+            $Skipped++
             $Results.Add([PSCustomObject]@{
-                ErrorCode   = $Err.Code
-                ShortName   = $Err.ShortName
-                Collection  = $CollectionName
-                Script      = $Err.RemediationScript
-                Status      = "Created"
+                Code        = $Code
+                State       = $Pair.State
+                Collection  = $Name
+                Description = $Description
+                Status      = "Skipped - already exists"
+            })
+            continue
+        }
+
+        Write-Step "+" "[$($Pair.State)] Code $Code — $Description" "Green"
+
+        if ($PSCmdlet.ShouldProcess($Name, "New-CMDeviceCollection")) {
+            try {
+                $NewCol = New-CMDeviceCollection `
+                    -LimitingCollectionName $LimitingCollection `
+                    -Name                   $Name `
+                    -Comment                $Description `
+                    -RefreshType            Periodic `
+                    -RefreshSchedule        $Schedule
+
+                Add-CMDeviceCollectionQueryMembershipRule `
+                    -CollectionName  $Name `
+                    -QueryExpression $Query `
+                    -RuleName        $Name
+
+                $NewCol | Move-CMObject -FolderPath $Pair.Folder
+
+                $Created++
+                $Results.Add([PSCustomObject]@{
+                    Code        = $Code
+                    State       = $Pair.State
+                    Collection  = $Name
+                    Description = $Description
+                    Status      = "Created"
+                })
+            }
+            catch {
+                Write-Step "!" "FAILED: $Name — $_" "Red"
+                $Failed++
+                $Results.Add([PSCustomObject]@{
+                    Code        = $Code
+                    State       = $Pair.State
+                    Collection  = $Name
+                    Description = $Description
+                    Status      = "Failed: $_"
+                })
+            }
+        }
+        else {
+            $Results.Add([PSCustomObject]@{
+                Code        = $Code
+                State       = $Pair.State
+                Collection  = $Name
+                Description = $Description
+                Status      = "WhatIf - would create"
             })
         }
-        catch {
-            Write-Step "!" "FAILED: $CollectionName - $_" "Red"
-            $Failed++
-            $Results.Add([PSCustomObject]@{
-                ErrorCode   = $Err.Code
-                ShortName   = $Err.ShortName
-                Collection  = $CollectionName
-                Script      = $Err.RemediationScript
-                Status      = "Failed: $_"
-            })
-        }
-    }
-    else {
-        # -WhatIf path
-        $Results.Add([PSCustomObject]@{
-            ErrorCode   = $Err.Code
-            ShortName   = $Err.ShortName
-            Collection  = $CollectionName
-            Script      = $Err.RemediationScript
-            Status      = "WhatIf - would create"
-        })
     }
 }
 
@@ -477,17 +397,54 @@ where
 # Summary
 # =============================================================================
 Write-Banner "Summary" "Cyan"
-Write-Host "  Total catalogued errors : $($PatchErrors.Count)"     -ForegroundColor Cyan
-Write-Host "  Collections Created     : $Created"                   -ForegroundColor Green
-Write-Host "  Collections Skipped     : $Skipped"                   -ForegroundColor DarkGray
-Write-Host "  Failures                : $Failed"                    -ForegroundColor $(if ($Failed -gt 0) { "Red" } else { "Green" })
+Write-Host "  Error codes in catalogue : $CodeCount"                                          -ForegroundColor Cyan
+Write-Host "  Total collections target : $Total  (2 per code)"                               -ForegroundColor Cyan
+Write-Host "  Created                  : $Created"                                            -ForegroundColor Green
+Write-Host "  Skipped (already exist)  : $Skipped"                                           -ForegroundColor DarkGray
+Write-Host "  Failed                   : $Failed"                                             -ForegroundColor $(if ($Failed) {"Red"} else {"Green"})
 Write-Host ""
 
-$Results | Format-Table ErrorCode, ShortName, Status -AutoSize
+$Results | Format-Table Code, State, Status, Description -AutoSize
 
-# Export run log
-$LogPath = Join-Path $PSScriptRoot "PatchErrorCollections_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$LogPath = Join-Path $PSScriptRoot "SUPErrorCollections_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 $Results | Export-Csv -Path $LogPath -NoTypeInformation -Encoding UTF8
 Write-Step ">" "Run log saved: $LogPath" "Cyan"
 
 Set-Location $env:SystemDrive
+
+<#
+===============================================================================
+REFERENCE
+===============================================================================
+
+StatusType values in SMS_SUMDeploymentAssetDetails:
+  1 = Success
+  2 = In Progress
+  3 = Unknown (no status reported)
+  4 = Unknown (with a LastEnforcementErrorCode present)
+  5 = Error   (with a LastEnforcementErrorCode present)
+  6 = Requirements Not Met
+
+PowerShell decimal conversions:
+  Hex to signed decimal:  [int32][uint32]"0x80070005"    →  -2147024891
+  Signed decimal to hex:  "0x{0:X8}" -f [uint32][int32]-2147024891  →  0x80070005
+
+SQL to discover NEW error codes in your environment:
+  SELECT COUNT(ResourceID) AS Devices,
+         LastEnforcementErrorCode,
+         StatusType
+  FROM vSMS_SUMDeploymentStatusPerAsset
+  WHERE StatusType IN (4,5)
+    AND LastEnforcementErrorCode IS NOT NULL
+    AND LastEnforcementErrorCode <> 0
+  GROUP BY LastEnforcementErrorCode, StatusType
+  ORDER BY COUNT(ResourceID) DESC
+
+Adding a new error code:
+  1. Run the SQL above to discover codes in your environment
+  2. Add the signed decimal as a new key in $ErrorCodes with a description
+  3. Create a matching Remediate-*.ps1 if the error needs unique remediation
+  4. Re-run this script — existing collections are skipped automatically
+
+===============================================================================
+#>
